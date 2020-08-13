@@ -48,7 +48,7 @@ from .cache import IdentityCache, OutstandingQueriesCache, StateCache
 from .conf import get_config
 from .exceptions import IdPConfigurationMissing
 from .overrides import Saml2Client
-from .utils import (available_idps, fail_acs_response, get_custom_setting,
+from .utils import (available_idps, get_custom_setting,
                     get_idp_sso_supported_bindings, get_location,
                     validate_referral_url)
 
@@ -269,6 +269,38 @@ class AssertionConsumerServiceView(SPConfigMixin, View):
         though some implementations may instead register their own subclasses of Saml2Backend.
     """
 
+    def handle_acs_failure(self, request, exception=None, status=403, **kwargs):
+        """ Error handler if the login attempt fails. Override this to customize the error response.
+        """
+
+        if exception:
+            if isinstance(exception, StatusError) or isinstance(exception, ToEarly):
+                logger.exception("Error processing SAML Assertion.")
+            elif isinstance(exception, ResponseLifetimeExceed):
+                logger.info(("SAML Assertion is no longer valid. Possibly caused by network delay or replay attack."), exc_info=True)
+            elif isinstance(exception, SignatureError):
+                logger.info("Invalid or malformed SAML Assertion.", exc_info=True)
+            elif isinstance(exception, StatusAuthnFailed):
+                logger.info("Authentication denied for user by IdP.", exc_info=True)
+            elif isinstance(exception, StatusRequestDenied):
+                logger.warning("Authentication interrupted at IdP.", exc_info=True)
+            elif isinstance(exception, StatusNoAuthnContext):
+                logger.warning("Missing Authentication Context from IdP.", exc_info=True)
+            elif isinstance(exception, MissingKey):
+                logger.exception("SAML Identity Provider is not configured correctly: certificate key is missing!")
+            elif isinstance(exception, UnsolicitedResponse):
+                logger.exception("Received SAMLResponse when no request has been made.")
+            else:
+                logger.exception("Uncategorized exception type occured.")
+
+        # Backwards compatibility: if a custom setting was defined, use that one
+        custom_failure_function = get_custom_setting('SAML_ACS_FAILURE_RESPONSE_FUNCTION')
+        if custom_failure_function:
+            failure_function = custom_failure_function if callable(custom_failure_function) else import_string(custom_failure_function)
+            return failure_function(request, exception, status, **kwargs)
+
+        return render(request, 'djangosaml2/login_error.html', {'exception': exception}, status=status)
+
     def post(self, request, attribute_mapping=None, create_unknown_user=None):
         """ SAML Authorization Response endpoint
         """
@@ -286,41 +318,14 @@ class AssertionConsumerServiceView(SPConfigMixin, View):
         oq_cache.sync()
         outstanding_queries = oq_cache.outstanding_queries()
 
-        _exception = None
         try:
-            response = client.parse_authn_request_response(request.POST['SAMLResponse'],
-                                                           BINDING_HTTP_POST,
-                                                           outstanding_queries)
-        except (StatusError, ToEarly) as e:
-            _exception = e
-            logger.exception("Error processing SAML Assertion.")
-        except ResponseLifetimeExceed as e:
-            _exception = e
-            logger.info(("SAML Assertion is no longer valid. Possibly caused by network delay or replay attack."), exc_info=True)
-        except SignatureError as e:
-            _exception = e
-            logger.info("Invalid or malformed SAML Assertion.", exc_info=True)
-        except StatusAuthnFailed as e:
-            _exception = e
-            logger.info("Authentication denied for user by IdP.", exc_info=True)
-        except StatusRequestDenied as e:
-            _exception = e
-            logger.warning("Authentication interrupted at IdP.", exc_info=True)
-        except StatusNoAuthnContext as e:
-            _exception = e
-            logger.warning("Missing Authentication Context from IdP.", exc_info=True)
-        except MissingKey as e:
-            _exception = e
-            logger.exception("SAML Identity Provider is not configured correctly: certificate key is missing!")
-        except UnsolicitedResponse as e:
-            _exception = e
-            logger.exception("Received SAMLResponse when no request has been made.")
-
-        if _exception:
-            return fail_acs_response(request, exception=_exception)
-        elif response is None:
+            response = client.parse_authn_request_response(request.POST['SAMLResponse'], BINDING_HTTP_POST, outstanding_queries)
+        except Exception as e:
+            return self.handle_acs_failure(request, exception=e)
+        
+        if response is None:
             logger.warning("Invalid SAML Assertion received (unknown error).")
-            return fail_acs_response(request, status=400, exception=SuspiciousOperation('Unknown SAML2 error'))
+            return self.handle_acs_failure(request, status=400, exception=SuspiciousOperation('Unknown SAML2 error'))
 
         session_id = response.session_id()
         oq_cache.delete(session_id)
@@ -340,7 +345,7 @@ class AssertionConsumerServiceView(SPConfigMixin, View):
                                  create_unknown_user=create_unknown_user)
         if user is None:
             logger.warning("Could not authenticate user received in SAML Assertion. Session info: %s", session_info)
-            return fail_acs_response(request, exception=PermissionDenied('No user could be authenticated.'))
+            return self.handle_acs_failure(request, exception=PermissionDenied('No user could be authenticated.'))
 
         auth.login(self.request, user)
         _set_subject_id(request.saml_session, session_info['name_id'])
